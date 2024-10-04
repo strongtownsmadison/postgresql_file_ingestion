@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "/home/bnoffke/postgresql_file_ingestion/venv/bin/python3",
+    "python.analysis.extraPaths": [
+        "/home/bnoffke/postgresql_file_ingestion/src"
+    ],
+    "python.terminal.activateEnvironment": true,
+    "python.terminal.activateEnvInCurrentTerminal": true
+}
