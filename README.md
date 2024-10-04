@@ -7,6 +7,8 @@ Right now this only contains ingestion for tax roll xlsx files.
 
 FYI, I haven't done really robust python development before, so a lot of concepts are new to me. I'm using Claude/ChatGPT to fill gaps and learn, so feel free to point out anything ridiculous I'm doing.
 
+If you want to talk about anything, you can @Ben Noffke on the Madison Strong Towns Discord.
+
 ## Set up to run locally
 I need to really build this out/script a way to make it easier for people.
 
