@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS staging.tax_roll_xlsx (
+    id SERIAL PRIMARY KEY,
+    data_json JSONB NOT NULL,
+    load_dttm TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
