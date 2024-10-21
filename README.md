@@ -30,13 +30,11 @@ Prereqs:
   - To-do: The SOURCE_DIR needs to be more specific to the ingestion task
 - Activate the environment:
   - ```source ./venv/bin/activate```
-- You can run the tax roll ingestion with
-  - ```python3 -m src.tax_roll_excel_ingest.tax_roll_excel_ingest```
+- You can run the tax roll ingestion with (this is the only way I can get relative imports working)
+  - ```python3 -m src.tax_roll_excel_ingest```
   - This will look for tax roll xlsx files in ```SOURCE_DIR```.
 
 ## Some other to-dos
-- Get the utils stuff working as a package
-  - Works as module call (```python), not as console script
 - Get GitHub secrets for prod connection
 - Containerize
   - Lots to figure out here

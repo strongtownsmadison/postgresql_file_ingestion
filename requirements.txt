@@ -7,4 +7,3 @@ setuptools==74.0.0
 
 #local packages
 -e .
--e ./utils
