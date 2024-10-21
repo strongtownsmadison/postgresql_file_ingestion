@@ -9,7 +9,9 @@ from datetime import datetime
 import shutil
 
 # Capture the output of a command
-from utils import PostgreSQLDatabase
+#import utils
+#from src.utils.db_connection.db_connection import PostgreSQLDatabase
+from ..utils.db_connection import PostgreSQLDatabase
 
 # Source file directory
 SOURCE_DIR = os.getenv('SOURCE_DIR')
