@@ -1,20 +1,13 @@
 import os
 import json
 import pandas as pd
-import numpy as np
 from pathlib import Path
-#Bandaid until I figure out how to make the utils stuff a working package
-#sys.path.append(str(Path(__file__).parent.parent))
-from datetime import datetime
-import shutil
-
-# Capture the output of a command
-#import utils
-#from src.utils.db_connection.db_connection import PostgreSQLDatabase
 from ..utils.db_connection import PostgreSQLDatabase
+from ..utils.file_handler import archive_file
 
 # Source file directory
 SOURCE_DIR = os.getenv('SOURCE_DIR')
+XLSX_DIR = 'tax_roll_xlsx/'
 
 def find_header_row(df):
     """Find the header row in the DataFrame."""
@@ -36,26 +29,6 @@ def process_file(file_path):
     # Convert DataFrame to list of JSON strings
     return [json.dumps(row.to_dict()) for _, row in df.iterrows()]
 
-def archive_file(file_path):
-    """
-    Archive the processed file with a timestamp in its filename.
-    Returns the path of the archived file.
-    """
-    source_path = Path(file_path)
-    archive_dir = source_path.parent / 'archive'
-    
-    # Create archive directory if it doesn't exist
-    archive_dir.mkdir(exist_ok=True)
-    
-    # Generate new filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    new_filename = f"{source_path.stem}_{timestamp}{source_path.suffix}"
-    archive_path = archive_dir / new_filename
-    
-    # Move the file to archive directory
-    shutil.move(str(source_path), str(archive_path))
-    print(f"Archived file to: {archive_path}")
-    return archive_path
 
 def main():
     db = PostgreSQLDatabase()
@@ -71,6 +44,7 @@ def main():
         if not source_dir:
             raise EnvironmentError("SOURCE_DIR environment variable is not set")
         
+        source_dir = Path.joinpath(source_dir,XLSX_DIR)
         # Process all XLSX files in the source directory
         for file in Path(source_dir).glob('*.xlsx'):
             print(f"Processing file: {file}")
@@ -79,8 +53,8 @@ def main():
             print(f"Inserted {len(data)} rows from {file}")
 
             # Archive the file after successful processing
-            archived_path = archive_file(file)
-            print(f"Successfully processed and archived: {file} -> {archived_path}")
+            _ = archive_file(file)
+            
 
     except Exception as e:
         print(f"An error occurred: {e}")

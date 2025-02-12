@@ -2,6 +2,7 @@ import os
 import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
+from sqlalchemy import create_engine,text
 
 def load_env_vars():
     """Load environment variables based on the current environment."""
@@ -53,6 +54,10 @@ class PostgreSQLDatabase:
             self.conn.close()
             print("Database connection closed.")
 
+    def create_engine(self):
+        self.pgengine = create_engine(
+                    f'postgresql://{self.user}:{self.password}@{self.host}/{self.name}'
+                )
     def insert_data(self, table_name, data):
         """Insert data into the specified table."""
         if not self.conn:
@@ -80,3 +85,15 @@ class PostgreSQLDatabase:
         except Exception as e:
             print(f"Something went wrong: {e}")
             self.conn.rollback()
+    
+    def check_table_exists(self,table_name):
+        # Check if table exists
+        self.cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = %s
+            )
+        """, (table_name,))
+        table_exists = self.cursor.fetchone()[0]
+
+        return(table_exists)
