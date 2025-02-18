@@ -1,0 +1,40 @@
+--Repo summary--
+
+# postgresql_file_ingestion
+
+## .utils
+
+### db_connection.py
+- **Classes**:
+  - `PostgreSQLDatabase`: Handles interactions with a PostgreSQL database.
+    - **Methods**:
+      - `__init__()`: Initializes the database connection details.
+      - `connect()`: Establishes a connection to the database using provided credentials.
+      - `disconnect()`: Closes the database connection.
+      - `create_engine()`: Creates a SQL Alchemy engine for database connections.
+      - `insert_data(table_name, data)`: Inserts data into a specified table.
+      - `execute_from_file(filepath)`: Executes SQL commands from a given file.
+      - `check_table_exists(table_name)`: Checks if a specific table exists in the database.
+
+### file_handler.py
+- **Functions**:
+  - `archive_file(file_path)`: Archives a processed file with a timestamped filename.
+
+## tax_roll_excel_ingest
+### 
+- **Functions**:
+  - `main()`: Main function to process tax roll Excel files, loading data into the database.
+
+### __main__.py
+- **Functions**:
+    - `process_file(file_path)`: Reads and processes a single XLSX file, returning data as a list of JSON strings.
+- Helper Functions:
+  - `find_header_row(df)`: Finds the row in a DataFrame that contains the header.
+
+## geojson_shp_ingest
+### 
+- **Functions**:
+  - `main()`: Main function to load geographic files into PostgreSQL/PostGIS.
+- Helper Functions:
+  - `process_geo_file(file_path, target_srid)`: Reads and processes a geographic file, projecting it to the specified SRID if necessary.
+  - `load_geo_to_postgres(file_path, table_name, db, target_srid=None)`: Loads a geographic file into a PostgreSQL/PostGIS table.
