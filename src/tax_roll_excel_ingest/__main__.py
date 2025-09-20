@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import pandas as pd
 from pathlib import Path
 from ..utils.db_connection import PostgreSQLDatabase
@@ -31,6 +32,21 @@ def process_file(file_path):
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Process tax roll XLSX files')
+    parser.add_argument('--prod', action='store_true', 
+                       help='Run in production environment')
+    args = parser.parse_args()
+    
+    # Set environment based on argument BEFORE creating database instance
+    if args.prod:
+        os.environ['ENVIRONMENT'] = 'prod'
+        print("Running in production environment")
+    else:
+        # Explicitly set to 'dev' to ensure it's set
+        os.environ['ENVIRONMENT'] = 'dev'
+        print("Running in development environment")
+    
     db = PostgreSQLDatabase()
     
     try:
@@ -43,8 +59,7 @@ def main():
         source_dir = os.getenv('SOURCE_DIR')
         if not source_dir:
             raise EnvironmentError("SOURCE_DIR environment variable is not set")
-        
-        source_dir = Path.joinpath(source_dir,XLSX_DIR)
+        source_dir = Path(source_dir) / XLSX_DIR
         # Process all XLSX files in the source directory
         for file in Path(source_dir).glob('*.xlsx'):
             print(f"Processing file: {file}")

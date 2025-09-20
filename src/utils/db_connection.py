@@ -12,18 +12,21 @@ def load_env_vars():
     
     if env == 'dev':
         env_file = ".env.dev"
-        if not os.path.exists(env_file):
-            raise FileNotFoundError(f"Environment file {env_file} not found.")
-        load_dotenv(env_file)
-        print(f"Loaded development environment variables from {env_file}")
-    else:  # prod
-        # In production, we assume the secrets are set as environment variables
-        # typically done through GitHub Secrets and Actions
-        required_vars = ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        if missing_vars:
-            raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
-        print("Using production environment variables from GitHub Secrets")
+    if env == 'prod':
+        env_file = ".env.prod"
+    if not os.path.exists(env_file):
+        raise FileNotFoundError(f"Environment file {env_file} not found.")
+    load_dotenv(env_file)
+    print(f"Loaded {env} environment variables from {env_file}")
+    # else:  # prod
+    #     # In production, we assume the secrets are set as environment variables
+    #     # typically done through GitHub Secrets and Actions
+
+    #     required_vars = ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
+    #     missing_vars = [var for var in required_vars if not os.getenv(var)]
+    #     if missing_vars:
+    #         raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    #     print("Using production environment variables from GitHub Secrets")
 
 class PostgreSQLDatabase:
     def __init__(self):
