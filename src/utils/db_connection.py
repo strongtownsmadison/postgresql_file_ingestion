@@ -62,17 +62,31 @@ class PostgreSQLDatabase:
                     f'postgresql://{self.user}:{self.password}@{self.host}/{self.name}'
                 )
     def insert_data(self, table_name, data):
-        """Insert data into the specified table."""
+        """Insert data into the specified table with progress bar."""
         if not self.conn:
             raise ConnectionError("Database connection not established. Call connect() first.")
 
+        total_records = len(data)
+        print(f"Inserting {total_records} records into {table_name}...")
+        
         with self.conn.cursor() as cur:
-            for row in data:
+            for i, row in enumerate(data, 1):
                 cur.execute(
                     f"INSERT INTO {table_name} (data_json, load_dttm) VALUES (%s, %s)",
                     (row, datetime.now())
                 )
+                
+                # Update progress bar every 100 records or on the last record
+                if i % 100 == 0 or i == total_records:
+                    percentage = (i / total_records) * 100
+                    bar_length = 50
+                    filled_length = int(bar_length * percentage / 100)
+                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                    
+                    print(f"\r[{bar}] {percentage:.1f}% ({i:,}/{total_records:,})", end='', flush=True)
+        
         self.conn.commit()
+        print(f"\nCompleted! {total_records:,} records inserted successfully.")
     
     def execute_from_file(self,filepath):
         try:
