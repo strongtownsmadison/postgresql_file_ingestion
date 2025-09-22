@@ -2,7 +2,7 @@ import os
 import psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
-from sqlalchemy import create_engine,text
+from sqlalchemy import create_engine, text
 
 def load_env_vars():
     """Load environment variables based on the current environment."""
@@ -18,15 +18,6 @@ def load_env_vars():
         raise FileNotFoundError(f"Environment file {env_file} not found.")
     load_dotenv(env_file)
     print(f"Loaded {env} environment variables from {env_file}")
-    # else:  # prod
-    #     # In production, we assume the secrets are set as environment variables
-    #     # typically done through GitHub Secrets and Actions
-
-    #     required_vars = ['DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']
-    #     missing_vars = [var for var in required_vars if not os.getenv(var)]
-    #     if missing_vars:
-    #         raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    #     print("Using production environment variables from GitHub Secrets")
 
 class PostgreSQLDatabase:
     def __init__(self):
@@ -59,36 +50,140 @@ class PostgreSQLDatabase:
 
     def create_engine(self):
         self.pgengine = create_engine(
-                    f'postgresql://{self.user}:{self.password}@{self.host}/{self.name}'
-                )
-    def insert_data(self, table_name, data):
-        """Insert data into the specified table with progress bar."""
+            f'postgresql://{self.user}:{self.password}@{self.host}/{self.name}'
+        )
+
+    def check_table_exists(self, table_name, schema=None):
+        """
+        Check if a table exists in the database.
+        
+        Args:
+            table_name (str): Name of the table
+            schema (str): Schema name (optional, defaults to public)
+        
+        Returns:
+            bool: True if table exists, False otherwise
+        """
         if not self.conn:
             raise ConnectionError("Database connection not established. Call connect() first.")
+        
+        with self.conn.cursor() as cursor:
+            if schema:
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = %s
+                        AND table_name = %s
+                    )
+                """, (schema, table_name))
+            else:
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = %s
+                    )
+                """, (table_name,))
+            
+            table_exists = cursor.fetchone()[0]
+        
+        return table_exists
 
+    def insert_data(self, table_name, columns, data, schema=None, show_progress=True, 
+                   batch_size=100, commit_interval=1000):
+        """
+        Insert data into the specified table with flexible column support.
+        
+        Args:
+            table_name (str): Name of the table
+            columns (list): List of column names
+            data: Either a single row (list/tuple) or multiple rows (list of lists/tuples)
+            schema (str): Schema name (optional)
+            show_progress (bool): Show progress bar for bulk inserts
+            batch_size (int): Update progress every N records
+            commit_interval (int): Commit transaction every N records
+        
+        Examples:
+            # Single row insert
+            db.insert_data('users', ['name', 'email'], ['John', 'john@email.com'])
+            
+            # Bulk insert
+            db.insert_data('users', ['name', 'email'], [
+                ['John', 'john@email.com'],
+                ['Jane', 'jane@email.com']
+            ])
+            
+            # With schema
+            db.insert_data('features', ['feature_data'], [json_data], schema='staging')
+        """
+        if not self.conn:
+            raise ConnectionError("Database connection not established. Call connect() first.")
+        
+        # Build the table reference with optional schema
+        table_ref = f"{schema}.{table_name}" if schema else table_name
+        
+        # Build the INSERT statement
+        placeholders = ', '.join(['%s'] * len(columns))
+        column_names = ', '.join(columns)
+        insert_sql = f"INSERT INTO {table_ref} ({column_names}) VALUES ({placeholders})"
+        
+        # Determine if data is single row or multiple rows
+        if not data:
+            print("No data to insert.")
+            return 0
+        
+        # Check if data is a single row (not a list of lists)
+        is_single_row = False
+        if not isinstance(data[0], (list, tuple)):
+            is_single_row = True
+            data = [data]  # Convert to list of lists for uniform processing
+        
         total_records = len(data)
-        print(f"Inserting {total_records} records into {table_name}...")
+        inserted_count = 0
         
-        with self.conn.cursor() as cur:
-            for i, row in enumerate(data, 1):
-                cur.execute(
-                    f"INSERT INTO {table_name} (data_json, load_dttm) VALUES (%s, %s)",
-                    (row, datetime.now())
-                )
-                
-                # Update progress bar every 100 records or on the last record
-                if i % 100 == 0 or i == total_records:
-                    percentage = (i / total_records) * 100
-                    bar_length = 50
-                    filled_length = int(bar_length * percentage / 100)
-                    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        if show_progress and total_records > 1:
+            print(f"Inserting {total_records:,} records into {table_ref}...")
+        
+        try:
+            with self.conn.cursor() as cursor:
+                for i, row in enumerate(data, 1):
+                    cursor.execute(insert_sql, row)
+                    inserted_count += 1
                     
-                    print(f"\r[{bar}] {percentage:.1f}% ({i:,}/{total_records:,})", end='', flush=True)
+                    # Commit at intervals for large datasets
+                    if i % commit_interval == 0:
+                        self.conn.commit()
+                    
+                    # Update progress bar
+                    if show_progress and total_records > 1:
+                        if i % batch_size == 0 or i == total_records:
+                            percentage = (i / total_records) * 100
+                            bar_length = 50
+                            filled_length = int(bar_length * percentage / 100)
+                            bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                            
+                            print(f"\r[{bar}] {percentage:.1f}% ({i:,}/{total_records:,})", 
+                                 end='', flush=True)
+            
+            # Final commit
+            self.conn.commit()
+            
+            if show_progress and total_records > 1:
+                print(f"\nCompleted! {inserted_count:,} records inserted successfully.")
+            elif is_single_row:
+                print(f"1 record inserted into {table_ref}")
+            
+            return inserted_count
+            
+        except Exception as e:
+            self.conn.rollback()
+            print(f"\nError inserting data: {e}")
+            raise
+
+    def execute_from_file(self, filepath):
+        """Execute SQL script from file."""
+        if not self.conn:
+            raise ConnectionError("Database connection not established. Call connect() first.")
         
-        self.conn.commit()
-        print(f"\nCompleted! {total_records:,} records inserted successfully.")
-    
-    def execute_from_file(self,filepath):
         try:
             # Open the SQL file and execute its contents
             with open(filepath, 'r') as sql_file:
@@ -102,15 +197,41 @@ class PostgreSQLDatabase:
         except Exception as e:
             print(f"Something went wrong: {e}")
             self.conn.rollback()
-    
-    def check_table_exists(self,table_name):
-        # Check if table exists
-        self.cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = %s
-            )
-        """, (table_name,))
-        table_exists = self.cursor.fetchone()[0]
+            raise
 
-        return(table_exists)
+    def execute_query(self, query, params=None):
+        """
+        Execute a SELECT query and return results.
+        
+        Args:
+            query (str): SQL query to execute
+            params (tuple): Query parameters (optional)
+        
+        Returns:
+            list: Query results
+        """
+        if not self.conn:
+            raise ConnectionError("Database connection not established. Call connect() first.")
+        
+        with self.conn.cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchall()
+
+    def execute_command(self, command, params=None):
+        """
+        Execute a non-SELECT SQL command (INSERT, UPDATE, DELETE, CREATE, etc.).
+        
+        Args:
+            command (str): SQL command to execute
+            params (tuple): Command parameters (optional)
+        
+        Returns:
+            int: Number of affected rows (for DML commands)
+        """
+        if not self.conn:
+            raise ConnectionError("Database connection not established. Call connect() first.")
+        
+        with self.conn.cursor() as cursor:
+            cursor.execute(command, params)
+            self.conn.commit()
+            return cursor.rowcount

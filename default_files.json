@@ -1,0 +1,10 @@
+[
+  {
+    "file_path": "parcels.geojson",
+    "table_name": "parcels_geojson"
+  },
+  {
+    "file_path": "streets.geojson",
+    "table_name": "streets_geojson"
+  }
+]
