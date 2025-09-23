@@ -1,10 +1,35 @@
 [
   {
     "file_path": "parcels.geojson",
-    "table_name": "parcels_geojson"
+    "table_name": "parcels_geojson",
+    "validation": {
+      "compare_count": true,
+      "aggregates": [
+        {
+          "key_path": "properties.CurrentTotal",
+          "aggregate_type": "sum",
+          "display_name": "Total Property Value"
+        },
+        {
+          "key_path": "properties.NetTaxes",
+          "aggregate_type": "sum",
+          "display_name": "Total Net Taxes"
+        }
+      ]
+    }
   },
   {
-    "file_path": "streets.geojson",
-    "table_name": "streets_geojson"
+    "file_path": "streets.geojson", 
+    "table_name": "streets_geojson",
+    "validation": {
+      "compare_count": true,
+      "aggregates": [
+        {
+          "key_path": "properties.ShapeSTLength",
+          "aggregate_type": "sum",
+          "display_name": "Total Street Length"
+        }
+      ]
+    }
   }
 ]

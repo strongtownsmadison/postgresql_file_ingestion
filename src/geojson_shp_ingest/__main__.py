@@ -5,6 +5,7 @@ from fiona.crs import CRS
 from fiona.transform import transform_geom
 from pathlib import Path
 from datetime import datetime, date
+from decimal import Decimal
 import argparse
 from dotenv import load_dotenv
 from ..utils.db_connection import PostgreSQLDatabase
@@ -165,9 +166,327 @@ def create_table_and_indexes(db, table_name, schema='staging'):
     
     print(f"Created table {schema}.{table_name} with indexes")
 
-def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='staging'):
+def get_nested_value(data, key_path):
     """
-    Load shapefile or geojson to PostgreSQL with JSONB schema and load timestamp tracking
+    Navigate any dot-separated path in JSON
+    
+    Args:
+        data (dict): JSON data to navigate
+        key_path (str): Dot-separated path (e.g., 'properties.CurrentTotal')
+    
+    Returns:
+        Any: Value at the path or None if not found
+    """
+    keys = key_path.split('.')
+    value = data
+    for key in keys:
+        if isinstance(value, dict):
+            value = value.get(key)
+        else:
+            return None
+        if value is None:
+            break
+    return value
+
+def calculate_aggregate(values, aggregate_type):
+    """
+    Apply any aggregate function to a list of values
+    
+    Args:
+        values (list): List of values to aggregate
+        aggregate_type (str): Type of aggregation (sum, avg, min, max, count)
+    
+    Returns:
+        float: Aggregated value or None if no valid values
+    """
+    # Filter to numeric values only
+    numeric_values = []
+    for v in values:
+        if v is not None:
+            try:
+                numeric_val = float(v)
+                numeric_values.append(numeric_val)
+            except (TypeError, ValueError):
+                continue
+    
+    if not numeric_values:
+        return None
+    
+    if aggregate_type == 'sum':
+        return sum(numeric_values)
+    elif aggregate_type == 'avg':
+        return sum(numeric_values) / len(numeric_values)
+    elif aggregate_type == 'min':
+        return min(numeric_values)
+    elif aggregate_type == 'max':
+        return max(numeric_values)
+    elif aggregate_type == 'count':
+        return len(numeric_values)
+    else:
+        raise ValueError(f"Unsupported aggregate type: {aggregate_type}")
+
+def calculate_incoming_metrics(features, validation_config):
+    """
+    Calculate validation metrics from incoming features
+    
+    Args:
+        features (list): List of GeoJSON features
+        validation_config (dict): Validation configuration
+    
+    Returns:
+        dict: Dictionary of calculated metrics
+    """
+    metrics = {}
+    
+    # Calculate record count
+    metrics['record_count'] = len(features)
+    
+    # Calculate aggregates if configured
+    if 'aggregates' in validation_config:
+        for agg_config in validation_config['aggregates']:
+            key_path = agg_config['key_path']
+            aggregate_type = agg_config.get('aggregate_type', 'sum')
+            display_name = agg_config.get('display_name', key_path)
+            
+            # Extract values from all features
+            values = []
+            for feature in features:
+                value = get_nested_value(feature, key_path)
+                if value is not None:
+                    values.append(value)
+            
+            # Calculate aggregate
+            agg_value = calculate_aggregate(values, aggregate_type)
+            metrics[display_name] = agg_value
+    
+    return metrics
+
+def query_existing_metrics(db, table_name, schema, validation_config):
+    """
+    Query existing table for current metrics
+    
+    Args:
+        db (PostgreSQLDatabase): Database connection
+        table_name (str): Table name
+        schema (str): Schema name
+        validation_config (dict): Validation configuration
+    
+    Returns:
+        dict: Dictionary of current metrics or None if table doesn't exist
+    """
+    # Check if table exists
+    if not db.check_table_exists(table_name, schema):
+        return None
+    
+    metrics = {}
+    
+    # Build dynamic query based on validation config
+    select_parts = ["COUNT(*) as record_count"]
+    
+    if 'aggregates' in validation_config:
+        for i, agg_config in enumerate(validation_config['aggregates']):
+            key_path = agg_config['key_path']
+            aggregate_type = agg_config.get('aggregate_type', 'sum')
+            display_name = agg_config.get('display_name', key_path)
+            
+            # Build JSONB path for query
+            json_path_parts = key_path.split('.')
+            json_accessor = "feature_data"
+            for j, part in enumerate(json_path_parts[:-1]):
+                json_accessor += f"->'{part}'"
+            # Last part uses ->> to get text value
+            json_accessor += f"->>'{json_path_parts[-1]}'"
+            
+            # Add aggregate to query
+            if aggregate_type == 'sum':
+                select_parts.append(f"SUM(({json_accessor})::numeric) as agg_{i}")
+            elif aggregate_type == 'avg':
+                select_parts.append(f"AVG(({json_accessor})::numeric) as agg_{i}")
+            elif aggregate_type == 'min':
+                select_parts.append(f"MIN(({json_accessor})::numeric) as agg_{i}")
+            elif aggregate_type == 'max':
+                select_parts.append(f"MAX(({json_accessor})::numeric) as agg_{i}")
+            elif aggregate_type == 'count':
+                select_parts.append(f"COUNT({json_accessor}) as agg_{i}")
+    
+    query = f"SELECT {', '.join(select_parts)} FROM {schema}.{table_name}"
+    
+    try:
+        result = db.execute_query(query)
+        if result and len(result) > 0:
+            row = result[0]
+            # Convert count to int
+            metrics['record_count'] = int(row[0]) if row[0] is not None else 0
+            
+            # Map aggregate results to display names, converting Decimal to float
+            if 'aggregates' in validation_config:
+                for i, agg_config in enumerate(validation_config['aggregates']):
+                    display_name = agg_config.get('display_name', agg_config['key_path'])
+                    value = row[i + 1]
+                    # Convert Decimal to float for consistency
+                    if value is not None:
+                        try:
+                            metrics[display_name] = float(value)
+                        except (TypeError, ValueError):
+                            metrics[display_name] = None
+                    else:
+                        metrics[display_name] = None
+        
+        return metrics
+    except Exception as e:
+        print(f"Error querying existing metrics: {e}")
+        return None
+
+def format_number(value):
+    """Format number with thousand separators"""
+    if value is None:
+        return "N/A"
+    
+    # Convert Decimal to float for consistent handling
+    if isinstance(value, Decimal):
+        value = float(value)
+    
+    if isinstance(value, float):
+        # Check if it's effectively an integer
+        if value.is_integer():
+            return f"{int(value):,}"
+        else:
+            return f"{value:,.2f}"
+    elif isinstance(value, int):
+        return f"{value:,}"
+    
+    # Try to convert to float as a fallback
+    try:
+        value = float(value)
+        if value.is_integer():
+            return f"{int(value):,}"
+        else:
+            return f"{value:,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+def calculate_change(current, incoming):
+    """Calculate change and percentage change"""
+    if current is None or incoming is None:
+        return None, None
+    
+    # Convert to float to handle decimal.Decimal from PostgreSQL
+    try:
+        current_float = float(current)
+        incoming_float = float(incoming)
+    except (TypeError, ValueError):
+        return None, None
+    
+    change = incoming_float - current_float
+    if current_float != 0:
+        pct_change = (change / current_float) * 100
+    else:
+        pct_change = 100 if incoming_float > 0 else 0
+    
+    return change, pct_change
+
+def display_validation_report(table_name, current_metrics, incoming_metrics, validation_config):
+    """
+    Display a formatted validation report
+    
+    Args:
+        table_name (str): Name of the table
+        current_metrics (dict): Current table metrics (None if table doesn't exist)
+        incoming_metrics (dict): Incoming data metrics
+        validation_config (dict): Validation configuration
+    
+    Returns:
+        bool: True if changes were detected, False if identical
+    """
+    print("\n" + "=" * 60)
+    print(f"VALIDATION REPORT: {table_name}")
+    print("=" * 60)
+    
+    if current_metrics is None:
+        print("Table Status: New table - no existing data to compare")
+        print(f"\nIncoming Data:")
+        print(f"  Record Count: {format_number(incoming_metrics.get('record_count'))}")
+        
+        if 'aggregates' in validation_config:
+            for agg_config in validation_config['aggregates']:
+                display_name = agg_config.get('display_name', agg_config['key_path'])
+                value = incoming_metrics.get(display_name)
+                print(f"  {display_name}: {format_number(value)}")
+        
+        return True  # Changes detected (new table)
+    else:
+        print("Table Status: Existing data found")
+        
+        changes_detected = False
+        
+        # Display record count comparison
+        print(f"\nRecord Count:")
+        current_count = current_metrics.get('record_count', 0)
+        incoming_count = incoming_metrics.get('record_count', 0)
+        count_change, count_pct = calculate_change(current_count, incoming_count)
+        
+        print(f"  Current:    {format_number(current_count)}")
+        print(f"  Incoming:   {format_number(incoming_count)}")
+        
+        if count_change is not None:
+            sign = "+" if count_change >= 0 else ""
+            print(f"  Change:     {sign}{format_number(count_change)} ({sign}{count_pct:.2f}%)")
+            if count_change != 0:
+                changes_detected = True
+        
+        # Display aggregate comparisons
+        if 'aggregates' in validation_config:
+            for agg_config in validation_config['aggregates']:
+                display_name = agg_config.get('display_name', agg_config['key_path'])
+                current_value = current_metrics.get(display_name)
+                incoming_value = incoming_metrics.get(display_name)
+                
+                print(f"\n{display_name}:")
+                print(f"  Current:    {format_number(current_value)}")
+                print(f"  Incoming:   {format_number(incoming_value)}")
+                
+                value_change, value_pct = calculate_change(current_value, incoming_value)
+                if value_change is not None:
+                    sign = "+" if value_change >= 0 else ""
+                    print(f"  Change:     {sign}{format_number(value_change)} ({sign}{value_pct:.2f}%)")
+                    if value_change != 0:
+                        changes_detected = True
+        
+        return changes_detected
+
+def prompt_user_approval(auto_approve=False, dry_run=False):
+    """
+    Prompt user for approval to proceed
+    
+    Args:
+        auto_approve (bool): Skip prompt and return True
+        dry_run (bool): If True, mention this is a dry run
+    
+    Returns:
+        bool: True if approved, False otherwise
+    """
+    if auto_approve:
+        print("\n[AUTO-APPROVED]")
+        return True
+    
+    if dry_run:
+        print("\n[DRY RUN - No changes will be made]")
+        return True
+    
+    print("\n" + "=" * 60)
+    while True:
+        response = input("Do you want to proceed with replacing the data? (yes/no): ").strip().lower()
+        if response in ['yes', 'y']:
+            return True
+        elif response in ['no', 'n']:
+            return False
+        else:
+            print("Please enter 'yes' or 'no'")
+
+def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=None, schema='staging', 
+                                        validation_config=None, auto_approve=False, dry_run=False, no_archive=False):
+    """
+    Load shapefile or geojson to PostgreSQL with validation and approval
     
     Args:
         file_path (str): Path to .shp or .geojson file
@@ -175,6 +494,10 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
         db (PostgreSQLDatabase): Instance of PostgreSQLDatabase class
         target_srid (int): Target SRID for the geometry (e.g., 4326 for WGS84)
         schema (str): Database schema (default: 'staging')
+        validation_config (dict): Validation configuration
+        auto_approve (bool): Skip manual approval
+        dry_run (bool): Show what would change without making changes
+        no_archive (bool): Don't archive files after processing
     
     Returns:
         bool: True if successful, False otherwise
@@ -187,11 +510,14 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
             return False
             
         # Read features from geographic file
+        print(f"Reading features from {file_path}...")
         features = read_geo_file(file_path, target_srid)
         
         if not features:
             print(f"Warning: No features found in {file_path}")
             return False
+        
+        print(f"Found {len(features)} features")
         
         # Ensure database connection
         if not db.conn:
@@ -200,11 +526,57 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
         # Check if schema exists, create if not
         db.execute_command(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         
-        # Check if table exists using the utility method
+        # Perform validation if configured
+        changes_detected = True  # Default to true for backward compatibility
+        
+        if validation_config:
+            # Calculate metrics from incoming data
+            print("Calculating validation metrics...")
+            incoming_metrics = calculate_incoming_metrics(features, validation_config)
+            
+            # Query existing table metrics
+            current_metrics = query_existing_metrics(db, table_name, schema, validation_config)
+            
+            # Display validation report
+            changes_detected = display_validation_report(table_name, current_metrics, incoming_metrics, validation_config)
+            
+            if not changes_detected:
+                print("\n✓ No changes detected - data is identical")
+                return True
+            
+            # Prompt for approval
+            if not prompt_user_approval(auto_approve, dry_run):
+                print("\nUpdate cancelled by user")
+                return False
+        elif not auto_approve and not dry_run:
+            # Even without validation config, show basic info and ask for confirmation
+            table_exists = db.check_table_exists(table_name, schema)
+            print("\n" + "=" * 60)
+            print(f"LOADING SUMMARY: {table_name}")
+            print("=" * 60)
+            print(f"Table Status: {'Existing table will be replaced' if table_exists else 'New table will be created'}")
+            print(f"Incoming Records: {len(features):,}")
+            
+            if not prompt_user_approval(auto_approve, dry_run):
+                print("\nUpdate cancelled by user")
+                return False
+        
+        # If dry run, stop here
+        if dry_run:
+            print("\n[DRY RUN COMPLETED - No changes were made]")
+            return True
+        
+        # Check if table exists
         table_exists = db.check_table_exists(table_name, schema)
         
-        # Create table and indexes if it doesn't exist
-        if not table_exists:
+        # If table exists and we're doing snapshot loading, truncate it
+        if table_exists:
+            print(f"Truncating existing table {schema}.{table_name}...")
+            truncate_sql = f"TRUNCATE TABLE {schema}.{table_name}"
+            db.execute_command(truncate_sql)
+            print("Table truncated successfully")
+        else:
+            # Create table and indexes if it doesn't exist
             create_table_and_indexes(db, table_name, schema)
         
         # Prepare data for bulk insert
@@ -219,6 +591,7 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
             insert_data.append([feature_json, current_time])
         
         # Use the generalized insert_data method
+        print(f"Loading {len(features)} features into {schema}.{table_name}...")
         inserted_count = db.insert_data(
             table_name=table_name,
             columns=['feature_data', 'load_dttm'],
@@ -229,7 +602,16 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
             commit_interval=1000
         )
         
-        print(f"Successfully loaded {inserted_count} features into {schema}.{table_name}")
+        print(f"✓ Successfully loaded {inserted_count} features into {schema}.{table_name}")
+        
+        # Archive the file after successful processing (unless disabled)
+        if not no_archive:
+            try:
+                archived_path = archive_file(file_path)
+                print(f"✓ Archived {file_path} to {archived_path}")
+            except Exception as e:
+                print(f"Warning: Failed to archive {file_path}: {e}")
+        
         return True
         
     except Exception as e:
@@ -238,40 +620,60 @@ def load_geo_to_postgres(file_path, table_name, db, target_srid=None, schema='st
             db.conn.rollback()
         return False
 
-def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, schema='staging'):
-    """Process a list of files and their target tables"""
+def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, schema='staging', 
+                     auto_approve=False, dry_run=False, no_archive=False):
+    """Process a list of files and their target tables with validation"""
     successful_files = []
     failed_files = []
+    skipped_files = []
     
-    for item in file_list:
+    total_files = len(file_list)
+    
+    for idx, item in enumerate(file_list, 1):
         relative_file_path = item.get('file_path')
         table_name = item.get('table_name')
+        validation_config = item.get('validation')
         
         if relative_file_path and table_name:
             # Build full file path using directories
             full_file_path = build_file_path(source_dir, geo_dir, relative_file_path)
-            print(f"\nProcessing {full_file_path} to table {table_name}")
             
-            success = load_geo_to_postgres(full_file_path, table_name, db, target_srid, schema)
+            print(f"\n{'='*60}")
+            print(f"Processing file {idx}/{total_files}")
+            print(f"File: {full_file_path}")
+            print(f"Table: {schema}.{table_name}")
+            print(f"{'='*60}")
+            
+            success = load_geo_to_postgres_with_validation(
+                full_file_path, table_name, db, target_srid, schema,
+                validation_config, auto_approve, dry_run, no_archive
+            )
             
             if success:
                 successful_files.append(full_file_path)
-                # Archive the file after successful processing
-                try:
-                    archived_path = archive_file(full_file_path)
-                    print(f"Archived {full_file_path} to {archived_path}")
-                except Exception as e:
-                    print(f"Warning: Failed to archive {full_file_path}: {e}")
             else:
-                failed_files.append(full_file_path)
-                print(f"Failed to process {full_file_path}, file not archived")
+                # Check if it was user-cancelled vs error
+                if validation_config and not auto_approve:
+                    # Might have been cancelled by user
+                    skipped_files.append(full_file_path)
+                else:
+                    failed_files.append(full_file_path)
     
     # Print summary
     print("\n" + "="*60)
     print("PROCESSING SUMMARY")
     print("="*60)
-    print(f"Successfully processed: {len(successful_files)} files")
-    print(f"Failed to process: {len(failed_files)} files")
+    print(f"Total files processed: {total_files}")
+    print(f"✓ Successfully loaded: {len(successful_files)} files")
+    if skipped_files:
+        print(f"⊘ Skipped (user choice): {len(skipped_files)} files")
+    if failed_files:
+        print(f"✗ Failed to process: {len(failed_files)} files")
+    
+    if skipped_files:
+        print("\nSkipped files:")
+        for f in skipped_files:
+            print(f"  - {f}")
     
     if failed_files:
         print("\nFailed files:")
@@ -280,14 +682,17 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with JSONB schema')
+    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with validation and snapshot support')
     parser.add_argument('--dev', action='store_true', help='Use development environment', default=True)
     parser.add_argument('--prd', action='store_true', help='Use production environment', default=False)
     parser.add_argument('--file', type=str, help='Path to the geographic file (relative to SOURCE_DIR/geo_files or absolute)')
     parser.add_argument('--table', type=str, help='Target table name')
-    parser.add_argument('--json', type=str, help='JSON file containing file paths and table names (file paths in JSON will be relative to SOURCE_DIR/geo_files)')
+    parser.add_argument('--json', type=str, help='JSON file containing file paths, table names, and validation rules')
     parser.add_argument('--srid', type=int, help='Target SRID for geometry', default=4326)
     parser.add_argument('--schema', type=str, help='Database schema', default='staging')
+    parser.add_argument('--auto-approve', action='store_true', help='Skip manual confirmation (for automation)')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would change without making changes')
+    parser.add_argument('--no-archive', action='store_true', help="Don't archive files after processing")
     
     args = parser.parse_args()
     
@@ -305,6 +710,14 @@ def main():
     print(f"Geo files directory: {GEO_DIR}")
     print(f"Target schema: {args.schema}")
     print(f"Target SRID: {args.srid}")
+    
+    if args.dry_run:
+        print("Mode: DRY RUN (no changes will be made)")
+    elif args.auto_approve:
+        print("Mode: AUTO-APPROVE (no manual confirmation)")
+    else:
+        print("Mode: INTERACTIVE (manual approval required)")
+    
     print("-" * 60)
     
     # Initialize database connection
@@ -324,7 +737,8 @@ def main():
                 file_list = json.load(f)
             
             print(f"Processing {len(file_list)} files from JSON configuration")
-            process_file_list(file_list, db, SOURCE_DIR, GEO_DIR, args.srid, args.schema)
+            process_file_list(file_list, db, SOURCE_DIR, GEO_DIR, args.srid, args.schema,
+                            args.auto_approve, args.dry_run, args.no_archive)
             
         elif args.file and args.table:
             # Build full file path using directories
@@ -332,17 +746,13 @@ def main():
             print(f"Processing single file: {full_file_path}")
             print(f"Target table: {args.table}")
             
-            success = load_geo_to_postgres(full_file_path, args.table, db, args.srid, args.schema)
+            success = load_geo_to_postgres_with_validation(
+                full_file_path, args.table, db, args.srid, args.schema,
+                None,  # No validation config for single file mode
+                args.auto_approve, args.dry_run, args.no_archive
+            )
             
-            if success:
-                # Archive the file after successful processing
-                try:
-                    archived_path = archive_file(full_file_path)
-                    print(f"Archived {full_file_path} to {archived_path}")
-                except Exception as e:
-                    print(f"Warning: Failed to archive {full_file_path}: {e}")
-            else:
-                print(f"Failed to process {full_file_path}, file not archived")
+            if not success:
                 return 1
         else:
             print("Error: Either provide --file and --table or --json arguments")
@@ -360,4 +770,3 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
-    
