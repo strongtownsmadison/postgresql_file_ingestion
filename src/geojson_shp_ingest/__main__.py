@@ -166,6 +166,135 @@ def create_table_and_indexes(db, table_name, schema='staging'):
     
     print(f"Created table {schema}.{table_name} with indexes")
 
+def check_year_boundary(db, table_name, schema):
+    """
+    Check if current year is different from the year of max(load_dttm) in the table
+    
+    Args:
+        db (PostgreSQLDatabase): Database connection
+        table_name (str): Table name
+        schema (str): Schema name
+    
+    Returns:
+        tuple: (crosses_year_boundary: bool, max_load_year: int or None)
+    """
+    try:
+        query = f"SELECT MAX(load_dttm) FROM {schema}.{table_name}"
+        result = db.execute_query(query)
+        
+        if result and result[0][0]:
+            max_load_dttm = result[0][0]
+            max_load_year = max_load_dttm.year
+            current_year = datetime.now().year
+            
+            return (current_year > max_load_year, max_load_year)
+        else:
+            # No data in table
+            return (False, None)
+    except Exception as e:
+        print(f"Error checking year boundary: {e}")
+        return (False, None)
+
+def ensure_history_table(db, source_table, schema):
+    """
+    Ensure history table exists with same structure as source but no DEFAULT on load_dttm
+    
+    Args:
+        db (PostgreSQLDatabase): Database connection
+        source_table (str): Source table name
+        schema (str): Schema name
+    
+    Returns:
+        str: History table name
+    """
+    history_table = f"{source_table}_history"
+    
+    # Check if history table exists
+    if db.check_table_exists(history_table, schema):
+        print(f"History table {schema}.{history_table} already exists")
+        return history_table
+    
+    print(f"Creating history table {schema}.{history_table}...")
+    
+    try:
+        # Create history table with same structure but no DEFAULT on load_dttm
+        create_history_sql = f"""
+        CREATE TABLE {schema}.{history_table} (
+            feature_data JSONB,
+            load_dttm TIMESTAMP  -- No DEFAULT clause to preserve original timestamps
+        )
+        """
+        db.execute_command(create_history_sql)
+        
+        # Create same indexes as source table
+        gin_index_sql = f"""
+        CREATE INDEX IF NOT EXISTS idx_{history_table}_feature_data 
+        ON {schema}.{history_table} USING gin(feature_data)
+        """
+        db.execute_command(gin_index_sql)
+        
+        btree_index_sql = f"""
+        CREATE INDEX IF NOT EXISTS idx_{history_table}_load_dttm 
+        ON {schema}.{history_table}(load_dttm)
+        """
+        db.execute_command(btree_index_sql)
+        
+        print(f"Created history table {schema}.{history_table} with indexes")
+        return history_table
+        
+    except Exception as e:
+        print(f"Error creating history table: {e}")
+        raise
+
+def archive_to_history(db, source_table, history_table, schema, year):
+    """
+    Archive current table contents to history table
+    
+    Args:
+        db (PostgreSQLDatabase): Database connection
+        source_table (str): Source table name
+        history_table (str): History table name
+        schema (str): Schema name
+        year (int): Year being archived
+    
+    Returns:
+        bool: Success status
+    """
+    try:
+        # Get count of records to archive
+        count_query = f"SELECT COUNT(*) FROM {schema}.{source_table}"
+        result = db.execute_query(count_query)
+        source_count = result[0][0] if result else 0
+        
+        print(f"Archiving {source_count:,} records from year {year}...")
+        
+        # Insert all records from source to history
+        insert_sql = f"""
+        INSERT INTO {schema}.{history_table} 
+        SELECT * FROM {schema}.{source_table}
+        """
+        
+        db.execute_command(insert_sql)
+        
+        # Verify insert count
+        verify_query = f"""
+        SELECT COUNT(*) FROM {schema}.{history_table} 
+        WHERE EXTRACT(YEAR FROM load_dttm) = {year}
+        """
+        result = db.execute_query(verify_query)
+        archived_count = result[0][0] if result else 0
+        
+        if archived_count > 0:
+            print(f"✓ Archived {archived_count:,} records from year {year}")
+            return True
+        else:
+            print(f"Warning: No records were archived")
+            return False
+            
+    except Exception as e:
+        print(f"Error during archival: {e}")
+        return False
+
 def get_nested_value(data, key_path):
     """
     Navigate any dot-separated path in JSON
@@ -484,7 +613,8 @@ def prompt_user_approval(auto_approve=False, dry_run=False):
             print("Please enter 'yes' or 'no'")
 
 def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=None, schema='staging', 
-                                        validation_config=None, auto_approve=False, dry_run=False, no_archive=False):
+                                        validation_config=None, auto_approve=False, dry_run=False, 
+                                        no_archive=False, no_history=False, force_history=False):
     """
     Load shapefile or geojson to PostgreSQL with validation and approval
     
@@ -498,16 +628,18 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
         auto_approve (bool): Skip manual approval
         dry_run (bool): Show what would change without making changes
         no_archive (bool): Don't archive files after processing
+        no_history (bool): Skip history archival even if year boundary detected
+        force_history (bool): Force archival regardless of year boundary
     
     Returns:
-        bool: True if successful, False otherwise
+        tuple: (success: bool, year_archived: bool)
     """
     
     try:
         # Verify file exists before processing
         if not os.path.exists(file_path):
             print(f"Error: File not found: {file_path}")
-            return False
+            return (False, False)
             
         # Read features from geographic file
         print(f"Reading features from {file_path}...")
@@ -515,7 +647,7 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
         
         if not features:
             print(f"Warning: No features found in {file_path}")
-            return False
+            return (False, False)
         
         print(f"Found {len(features)} features")
         
@@ -526,7 +658,10 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
         # Check if schema exists, create if not
         db.execute_command(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         
-        # Perform validation if configured
+        # Check if table exists first
+        table_exists = db.check_table_exists(table_name, schema)
+        
+        # STEP 1: VALIDATION
         changes_detected = True  # Default to true for backward compatibility
         
         if validation_config:
@@ -540,36 +675,89 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
             # Display validation report
             changes_detected = display_validation_report(table_name, current_metrics, incoming_metrics, validation_config)
             
-            if not changes_detected:
-                print("\n✓ No changes detected - data is identical")
-                return True
+            # Note: We proceed even if no changes detected - validation is just a gut check
+            # The commented out section has been removed as requested
             
             # Prompt for approval
             if not prompt_user_approval(auto_approve, dry_run):
                 print("\nUpdate cancelled by user")
-                return False
+                return (False, False)
         elif not auto_approve and not dry_run:
             # Even without validation config, show basic info and ask for confirmation
-            table_exists = db.check_table_exists(table_name, schema)
-            print("\n" + "=" * 60)
-            print(f"LOADING SUMMARY: {table_name}")
-            print("=" * 60)
-            print(f"Table Status: {'Existing table will be replaced' if table_exists else 'New table will be created'}")
-            print(f"Incoming Records: {len(features):,}")
+            if not table_exists:
+                print("\n" + "=" * 60)
+                print(f"LOADING SUMMARY: {table_name}")
+                print("=" * 60)
+                print(f"Table Status: New table will be created")
+                print(f"Incoming Records: {len(features):,}")
+            else:
+                print("\n" + "=" * 60)
+                print(f"LOADING SUMMARY: {table_name}")
+                print("=" * 60)
+                print(f"Table Status: Existing table will be replaced")
+                print(f"Incoming Records: {len(features):,}")
             
             if not prompt_user_approval(auto_approve, dry_run):
                 print("\nUpdate cancelled by user")
-                return False
+                return (False, False)
         
         # If dry run, stop here
         if dry_run:
             print("\n[DRY RUN COMPLETED - No changes were made]")
-            return True
+            return (True, False)
         
-        # Check if table exists
-        table_exists = db.check_table_exists(table_name, schema)
+        # STEP 2: YEARLY ARCHIVAL (after validation approval)
+        year_archived = False
+        if table_exists and not no_history:
+            # Check for year boundary crossing
+            crosses_year, last_year = check_year_boundary(db, table_name, schema)
+            
+            # Force history if requested
+            if force_history and not crosses_year:
+                crosses_year = True
+                last_year = datetime.now().year  # Use current year for forced archive
+                print(f"\n[FORCE HISTORY: Archiving current data as year {last_year}]")
+            
+            if crosses_year and last_year is not None:
+                print(f"\n{'='*60}")
+                print(f"YEAR BOUNDARY DETECTED: {last_year} → {datetime.now().year}")
+                print(f"Proceeding with yearly snapshot archival...")
+                print(f"{'='*60}")
+                
+                try:
+                    # Start transaction for archive
+                    db.execute_command("BEGIN")
+                    
+                    # Ensure history table exists
+                    history_table = ensure_history_table(db, table_name, schema)
+                    print(f"History table: {schema}.{history_table}")
+                    
+                    # Archive current table contents
+                    print(f"Archiving {last_year} data before replacement...")
+                    success = archive_to_history(db, table_name, history_table, schema, last_year)
+                    
+                    if success:
+                        print(f"✓ Successfully archived year {last_year} snapshot")
+                        db.execute_command("COMMIT")
+                        year_archived = True
+                    else:
+                        raise Exception("Archive operation failed")
+                    
+                except Exception as e:
+                    db.execute_command("ROLLBACK")
+                    print(f"✗ Archive failed: {e}")
+                    # Since we've already validated and approved, ask if they want to continue
+                    if not auto_approve:
+                        response = input("Continue without archiving? (yes/no): ").strip().lower()
+                        if response not in ['yes', 'y']:
+                            print("Operation cancelled due to archive failure")
+                            return (False, False)
+                    else:
+                        # In auto-approve mode, fail the operation if archival fails
+                        print("Operation cancelled due to archive failure (auto-approve mode)")
+                        return (False, False)
         
-        # If table exists and we're doing snapshot loading, truncate it
+        # STEP 3: REPLACE DATA
         if table_exists:
             print(f"Truncating existing table {schema}.{table_name}...")
             truncate_sql = f"TRUNCATE TABLE {schema}.{table_name}"
@@ -612,20 +800,22 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
             except Exception as e:
                 print(f"Warning: Failed to archive {file_path}: {e}")
         
-        return True
+        # Return success and whether a year was archived
+        return (True, year_archived)
         
     except Exception as e:
         print(f"Error processing {file_path}: {e}")
         if db.conn:
             db.conn.rollback()
-        return False
+        return (False, False)
 
 def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, schema='staging', 
-                     auto_approve=False, dry_run=False, no_archive=False):
+                     auto_approve=False, dry_run=False, no_archive=False, no_history=False, force_history=False):
     """Process a list of files and their target tables with validation"""
     successful_files = []
     failed_files = []
     skipped_files = []
+    archived_tables = []  # Track actual archives that happened
     
     total_files = len(file_list)
     
@@ -633,6 +823,10 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
         relative_file_path = item.get('file_path')
         table_name = item.get('table_name')
         validation_config = item.get('validation')
+        
+        # Check for history configuration in the JSON
+        history_config = item.get('history', {})
+        item_no_history = no_history or not history_config.get('enabled', True)
         
         if relative_file_path and table_name:
             # Build full file path using directories
@@ -642,12 +836,41 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
             print(f"Processing file {idx}/{total_files}")
             print(f"File: {full_file_path}")
             print(f"Table: {schema}.{table_name}")
+            if item_no_history:
+                print(f"History: Disabled")
             print(f"{'='*60}")
             
-            success = load_geo_to_postgres_with_validation(
+            result = load_geo_to_postgres_with_validation(
                 full_file_path, table_name, db, target_srid, schema,
-                validation_config, auto_approve, dry_run, no_archive
+                validation_config, auto_approve, dry_run, no_archive, 
+                item_no_history, force_history
             )
+            
+            # Handle the tuple return value
+            if isinstance(result, tuple):
+                success, year_archived = result
+                if success and year_archived:
+                    # Get the actual year that was archived
+                    if db.check_table_exists(table_name, schema):
+                        # Query to get the year that was just archived to history
+                        history_table = f"{table_name}_history"
+                        if db.check_table_exists(history_table, schema):
+                            query = f"""
+                            SELECT DISTINCT EXTRACT(YEAR FROM load_dttm) as year 
+                            FROM {schema}.{history_table} 
+                            ORDER BY year DESC 
+                            LIMIT 1
+                            """
+                            try:
+                                result_year = db.execute_query(query)
+                                if result_year and result_year[0][0]:
+                                    archived_year = int(result_year[0][0])
+                                    archived_tables.append((table_name, archived_year))
+                            except:
+                                pass  # Silently ignore if we can't get the year
+            else:
+                # Backward compatibility if function returns boolean
+                success = result
             
             if success:
                 successful_files.append(full_file_path)
@@ -665,6 +888,10 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
     print("="*60)
     print(f"Total files processed: {total_files}")
     print(f"✓ Successfully loaded: {len(successful_files)} files")
+    if archived_tables:
+        print(f"📁 Yearly snapshots created: {len(archived_tables)}")
+        for table, year in archived_tables:
+            print(f"   - {table}: archived year {year}")
     if skipped_files:
         print(f"⊘ Skipped (user choice): {len(skipped_files)} files")
     if failed_files:
@@ -682,7 +909,7 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with validation and snapshot support')
+    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with validation and yearly snapshot support')
     parser.add_argument('--dev', action='store_true', help='Use development environment', default=True)
     parser.add_argument('--prd', action='store_true', help='Use production environment', default=False)
     parser.add_argument('--file', type=str, help='Path to the geographic file (relative to SOURCE_DIR/geo_files or absolute)')
@@ -693,6 +920,8 @@ def main():
     parser.add_argument('--auto-approve', action='store_true', help='Skip manual confirmation (for automation)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would change without making changes')
     parser.add_argument('--no-archive', action='store_true', help="Don't archive files after processing")
+    parser.add_argument('--no-history', action='store_true', help='Skip history archival even if year boundary detected')
+    parser.add_argument('--force-history', action='store_true', help='Force archival regardless of year boundary (useful for testing)')
     
     args = parser.parse_args()
     
@@ -710,6 +939,13 @@ def main():
     print(f"Geo files directory: {GEO_DIR}")
     print(f"Target schema: {args.schema}")
     print(f"Target SRID: {args.srid}")
+    
+    if args.no_history:
+        print("History archival: DISABLED")
+    elif args.force_history:
+        print("History archival: FORCED")
+    else:
+        print("History archival: Enabled (on year boundary)")
     
     if args.dry_run:
         print("Mode: DRY RUN (no changes will be made)")
@@ -738,7 +974,7 @@ def main():
             
             print(f"Processing {len(file_list)} files from JSON configuration")
             process_file_list(file_list, db, SOURCE_DIR, GEO_DIR, args.srid, args.schema,
-                            args.auto_approve, args.dry_run, args.no_archive)
+                            args.auto_approve, args.dry_run, args.no_archive, args.no_history, args.force_history)
             
         elif args.file and args.table:
             # Build full file path using directories
@@ -746,11 +982,17 @@ def main():
             print(f"Processing single file: {full_file_path}")
             print(f"Target table: {args.table}")
             
-            success = load_geo_to_postgres_with_validation(
+            result = load_geo_to_postgres_with_validation(
                 full_file_path, args.table, db, args.srid, args.schema,
                 None,  # No validation config for single file mode
-                args.auto_approve, args.dry_run, args.no_archive
+                args.auto_approve, args.dry_run, args.no_archive, args.no_history, args.force_history
             )
+            
+            # Handle tuple or boolean return
+            if isinstance(result, tuple):
+                success, year_archived = result
+            else:
+                success = result
             
             if not success:
                 return 1
