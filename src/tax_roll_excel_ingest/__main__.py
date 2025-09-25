@@ -52,8 +52,10 @@ def main():
     try:
         db.connect()
         
-        #Make sure staging table exists
+        #Make sure staging table exists and indexes
         db.execute_from_file('./src/tax_roll_excel_ingest/create_staging_tax_roll_xlsx.sql')
+        db.execute_from_file('./src/tax_roll_excel_ingest/create_load_dttm_index.sql')
+        db.execute_from_file('./src/tax_roll_excel_ingest/create_gin_index.sql')
 
         # Ensure SOURCE_DIR is set after environment variables are loaded
         source_dir = os.getenv('SOURCE_DIR')
