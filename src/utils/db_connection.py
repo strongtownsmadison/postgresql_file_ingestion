@@ -89,7 +89,7 @@ class PostgreSQLDatabase:
         return table_exists
 
     def insert_data(self, table_name, columns, data, schema=None, show_progress=True, 
-                   batch_size=100, commit_interval=1000):
+                   batch_size=100, column_transforms=None):
         """
         Insert data into the specified table with flexible column support.
         
@@ -100,7 +100,8 @@ class PostgreSQLDatabase:
             schema (str): Schema name (optional)
             show_progress (bool): Show progress bar for bulk inserts
             batch_size (int): Update progress every N records
-            commit_interval (int): Commit transaction every N records
+            column_transforms (dict): Optional dict mapping column names to SQL functions
+                                     e.g., {'geometry': 'ST_GeomFromGeoJSON'}
         
         Examples:
             # Single row insert
@@ -114,6 +115,11 @@ class PostgreSQLDatabase:
             
             # With schema
             db.insert_data('features', ['feature_data'], [json_data], schema='staging')
+            
+            # With PostGIS geometry
+            db.insert_data('geo_table', ['geometry', 'properties'], 
+                          [geojson_str, properties_json],
+                          column_transforms={'geometry': 'ST_GeomFromGeoJSON'})
         """
         if not self.conn:
             raise ConnectionError("Database connection not established. Call connect() first.")
@@ -121,10 +127,21 @@ class PostgreSQLDatabase:
         # Build the table reference with optional schema
         table_ref = f"{schema}.{table_name}" if schema else table_name
         
-        # Build the INSERT statement
-        placeholders = ', '.join(['%s'] * len(columns))
+        # Build the INSERT statement with optional SQL function transforms
+        if column_transforms:
+            placeholders = []
+            for col in columns:
+                if col in column_transforms:
+                    # Wrap placeholder with SQL function
+                    placeholders.append(f"{column_transforms[col]}(%s)")
+                else:
+                    placeholders.append("%s")
+            placeholders_str = ', '.join(placeholders)
+        else:
+            placeholders_str = ', '.join(['%s'] * len(columns))
+        
         column_names = ', '.join(columns)
-        insert_sql = f"INSERT INTO {table_ref} ({column_names}) VALUES ({placeholders})"
+        insert_sql = f"INSERT INTO {table_ref} ({column_names}) VALUES ({placeholders_str})"
         
         # Determine if data is single row or multiple rows
         if not data:
@@ -149,10 +166,6 @@ class PostgreSQLDatabase:
                     cursor.execute(insert_sql, row)
                     inserted_count += 1
                     
-                    # Commit at intervals for large datasets
-                    if i % commit_interval == 0:
-                        self.conn.commit()
-                    
                     # Update progress bar
                     if show_progress and total_records > 1:
                         if i % batch_size == 0 or i == total_records:
@@ -164,7 +177,7 @@ class PostgreSQLDatabase:
                             print(f"\r[{bar}] {percentage:.1f}% ({i:,}/{total_records:,})", 
                                  end='', flush=True)
             
-            # Final commit
+            # Single commit at the end - all-or-nothing
             self.conn.commit()
             
             if show_progress and total_records > 1:

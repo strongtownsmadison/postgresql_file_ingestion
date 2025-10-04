@@ -132,39 +132,83 @@ def read_geo_file(file_path, target_srid=None):
     
     return features
 
-def create_table_and_indexes(db, table_name, schema='staging'):
+def detect_geometry_type(features):
     """
-    Create table with JSONB schema and indexes
+    Detect geometry type from features
+    
+    Args:
+        features (list): List of GeoJSON features
+    
+    Returns:
+        str: Specific geometry type or 'Geometry' for mixed/unknown types
+    """
+    if not features:
+        return 'Geometry'
+    
+    geometry_types = set()
+    
+    for feature in features:
+        if 'geometry' in feature and feature['geometry']:
+            geom_type = feature['geometry'].get('type')
+            if geom_type:
+                geometry_types.add(geom_type)
+    
+    # If all features have the same geometry type, use it
+    if len(geometry_types) == 1:
+        specific_type = geometry_types.pop()
+        print(f"Detected geometry type: {specific_type}")
+        return specific_type
+    elif len(geometry_types) > 1:
+        print(f"Mixed geometry types detected: {geometry_types}")
+        print("Using generic 'Geometry' type")
+        return 'Geometry'
+    else:
+        print("No geometry type detected, using generic 'Geometry'")
+        return 'Geometry'
+
+def create_table_and_indexes(db, table_name, schema='staging', srid=4326, geometry_type='Geometry'):
+    """
+    Create table with PostGIS geometry column and JSONB for properties
     
     Args:
         db (PostgreSQLDatabase): Database connection instance
         table_name (str): Name of the table to create
         schema (str): Schema name (default: 'staging')
+        srid (int): Spatial Reference System ID
+        geometry_type (str): PostGIS geometry type (Point, LineString, Polygon, MultiPolygon, etc.)
     """
-    # Create table with JSONB schema
+    # Create table with PostGIS geometry column
     create_table_sql = f"""
     CREATE TABLE IF NOT EXISTS {schema}.{table_name} (
-        feature_data JSONB,
+        geometry GEOMETRY({geometry_type}, {srid}),
+        properties JSONB,
         load_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """
     db.execute_command(create_table_sql)
     
-    # Create GIN index on feature_data
+    # Spatial index on geometry (GIST is essential for spatial queries)
+    spatial_index_sql = f"""
+    CREATE INDEX IF NOT EXISTS idx_{table_name}_geometry 
+    ON {schema}.{table_name} USING GIST(geometry)
+    """
+    db.execute_command(spatial_index_sql)
+    
+    # GIN index on properties JSONB
     gin_index_sql = f"""
-    CREATE INDEX IF NOT EXISTS idx_{table_name}_feature_data 
-    ON {schema}.{table_name} USING gin(feature_data)
+    CREATE INDEX IF NOT EXISTS idx_{table_name}_properties 
+    ON {schema}.{table_name} USING GIN(properties)
     """
     db.execute_command(gin_index_sql)
     
-    # Create B-tree index on load_dttm
+    # B-tree index on load_dttm
     btree_index_sql = f"""
     CREATE INDEX IF NOT EXISTS idx_{table_name}_load_dttm 
     ON {schema}.{table_name}(load_dttm)
     """
     db.execute_command(btree_index_sql)
     
-    print(f"Created table {schema}.{table_name} with indexes")
+    print(f"Created table {schema}.{table_name} with GEOMETRY({geometry_type}, {srid}) and indexes")
 
 def check_year_boundary(db, table_name, schema):
     """
@@ -195,7 +239,7 @@ def check_year_boundary(db, table_name, schema):
         print(f"Error checking year boundary: {e}")
         return (False, None)
 
-def ensure_history_table(db, source_table, schema):
+def ensure_history_table(db, source_table, schema, srid=4326):
     """
     Ensure history table exists with same structure as source but no DEFAULT on load_dttm
     
@@ -203,6 +247,7 @@ def ensure_history_table(db, source_table, schema):
         db (PostgreSQLDatabase): Database connection
         source_table (str): Source table name
         schema (str): Schema name
+        srid (int): Spatial Reference System ID
     
     Returns:
         str: History table name
@@ -217,19 +262,48 @@ def ensure_history_table(db, source_table, schema):
     print(f"Creating history table {schema}.{history_table}...")
     
     try:
+        # Get geometry type from source table
+        geom_type_query = f"""
+        SELECT type 
+        FROM geometry_columns 
+        WHERE f_table_schema = '{schema}' 
+        AND f_table_name = '{source_table}' 
+        AND f_geometry_column = 'geometry'
+        """
+        result = db.execute_query(geom_type_query)
+        geometry_type = result[0][0] if result and result[0][0] else 'Geometry'
+        
+        # Get SRID from source table
+        srid_query = f"""
+        SELECT srid 
+        FROM geometry_columns 
+        WHERE f_table_schema = '{schema}' 
+        AND f_table_name = '{source_table}' 
+        AND f_geometry_column = 'geometry'
+        """
+        result = db.execute_query(srid_query)
+        table_srid = result[0][0] if result and result[0][0] else srid
+        
         # Create history table with same structure but no DEFAULT on load_dttm
         create_history_sql = f"""
         CREATE TABLE {schema}.{history_table} (
-            feature_data JSONB,
-            load_dttm TIMESTAMP  -- No DEFAULT clause to preserve original timestamps
+            geometry GEOMETRY({geometry_type}, {table_srid}),
+            properties JSONB,
+            load_dttm TIMESTAMP
         )
         """
         db.execute_command(create_history_sql)
         
         # Create same indexes as source table
+        spatial_index_sql = f"""
+        CREATE INDEX IF NOT EXISTS idx_{history_table}_geometry 
+        ON {schema}.{history_table} USING GIST(geometry)
+        """
+        db.execute_command(spatial_index_sql)
+        
         gin_index_sql = f"""
-        CREATE INDEX IF NOT EXISTS idx_{history_table}_feature_data 
-        ON {schema}.{history_table} USING gin(feature_data)
+        CREATE INDEX IF NOT EXISTS idx_{history_table}_properties 
+        ON {schema}.{history_table} USING GIN(properties)
         """
         db.execute_command(gin_index_sql)
         
@@ -239,7 +313,7 @@ def ensure_history_table(db, source_table, schema):
         """
         db.execute_command(btree_index_sql)
         
-        print(f"Created history table {schema}.{history_table} with indexes")
+        print(f"Created history table {schema}.{history_table} with GEOMETRY({geometry_type}, {table_srid}) and indexes")
         return history_table
         
     except Exception as e:
@@ -270,8 +344,8 @@ def archive_to_history(db, source_table, history_table, schema, year):
         
         # Insert all records from source to history
         insert_sql = f"""
-        INSERT INTO {schema}.{history_table} 
-        SELECT * FROM {schema}.{source_table}
+        INSERT INTO {schema}.{history_table} (geometry, properties, load_dttm)
+        SELECT geometry, properties, load_dttm FROM {schema}.{source_table}
         """
         
         db.execute_command(insert_sql)
@@ -380,7 +454,8 @@ def calculate_incoming_metrics(features, validation_config):
             # Extract values from all features
             values = []
             for feature in features:
-                value = get_nested_value(feature, key_path)
+                # For properties, we need to look in feature['properties']
+                value = get_nested_value(feature.get('properties', {}), key_path.replace('properties.', ''))
                 if value is not None:
                     values.append(value)
             
@@ -418,9 +493,11 @@ def query_existing_metrics(db, table_name, schema, validation_config):
             aggregate_type = agg_config.get('aggregate_type', 'sum')
             display_name = agg_config.get('display_name', key_path)
             
-            # Build JSONB path for query
-            json_path_parts = key_path.split('.')
-            json_accessor = "feature_data"
+            # Build JSONB path for query - now using 'properties' column
+            # Remove 'properties.' prefix if present in key_path
+            clean_key_path = key_path.replace('properties.', '')
+            json_path_parts = clean_key_path.split('.')
+            json_accessor = "properties"
             for j, part in enumerate(json_path_parts[:-1]):
                 json_accessor += f"->'{part}'"
             # Last part uses ->> to get text value
@@ -514,7 +591,7 @@ def calculate_change(current, incoming):
     
     return change, pct_change
 
-def display_validation_report(table_name, current_metrics, incoming_metrics, validation_config):
+def display_validation_report(table_name, current_metrics, incoming_metrics, validation_config, year_boundary_info=None):
     """
     Display a formatted validation report
     
@@ -523,6 +600,7 @@ def display_validation_report(table_name, current_metrics, incoming_metrics, val
         current_metrics (dict): Current table metrics (None if table doesn't exist)
         incoming_metrics (dict): Incoming data metrics
         validation_config (dict): Validation configuration
+        year_boundary_info (dict): Year boundary information with keys 'crosses', 'last_year', 'current_year'
     
     Returns:
         bool: True if changes were detected, False if identical
@@ -545,6 +623,13 @@ def display_validation_report(table_name, current_metrics, incoming_metrics, val
         return True  # Changes detected (new table)
     else:
         print("Table Status: Existing data found")
+        
+        # Show year boundary info prominently if present
+        if year_boundary_info and year_boundary_info['crosses']:
+            print(f"\nYEAR BOUNDARY CROSSED")
+            print(f"  Previous year: {year_boundary_info['last_year']}")
+            print(f"  Current year:  {year_boundary_info['current_year']}")
+            print(f"  → Historical snapshot will be created in {table_name}_history")
         
         changes_detected = False
         
@@ -604,7 +689,7 @@ def prompt_user_approval(auto_approve=False, dry_run=False):
     
     print("\n" + "=" * 60)
     while True:
-        response = input("Do you want to proceed with replacing the data? (yes/no): ").strip().lower()
+        response = input("Do you want to proceed with this update? (yes/no): ").strip().lower()
         if response in ['yes', 'y']:
             return True
         elif response in ['no', 'n']:
@@ -616,7 +701,7 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
                                         validation_config=None, auto_approve=False, dry_run=False, 
                                         no_archive=False, no_history=False, force_history=False):
     """
-    Load shapefile or geojson to PostgreSQL with validation and approval
+    Load shapefile or geojson to PostgreSQL with PostGIS geometry column
     
     Args:
         file_path (str): Path to .shp or .geojson file
@@ -651,6 +736,9 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
         
         print(f"Found {len(features)} features")
         
+        # Detect geometry type from features
+        geometry_type = detect_geometry_type(features)
+        
         # Ensure database connection
         if not db.conn:
             db.connect()
@@ -661,7 +749,23 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
         # Check if table exists first
         table_exists = db.check_table_exists(table_name, schema)
         
-        # STEP 1: VALIDATION
+        # STEP 1: CHECK YEAR BOUNDARY (before validation display)
+        year_boundary_info = None
+        if table_exists and not no_history:
+            crosses_year, last_year = check_year_boundary(db, table_name, schema)
+            
+            if force_history and not crosses_year:
+                crosses_year = True
+                last_year = datetime.now().year
+            
+            if crosses_year and last_year is not None:
+                year_boundary_info = {
+                    'crosses': True,
+                    'last_year': last_year,
+                    'current_year': datetime.now().year
+                }
+        
+        # STEP 2: VALIDATION WITH YEAR BOUNDARY INFO
         changes_detected = True  # Default to true for backward compatibility
         
         if validation_config:
@@ -672,11 +776,11 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
             # Query existing table metrics
             current_metrics = query_existing_metrics(db, table_name, schema, validation_config)
             
-            # Display validation report
-            changes_detected = display_validation_report(table_name, current_metrics, incoming_metrics, validation_config)
-            
-            # Note: We proceed even if no changes detected - validation is just a gut check
-            # The commented out section has been removed as requested
+            # Display validation report WITH year boundary info
+            changes_detected = display_validation_report(
+                table_name, current_metrics, incoming_metrics, 
+                validation_config, year_boundary_info
+            )
             
             # Prompt for approval
             if not prompt_user_approval(auto_approve, dry_run):
@@ -684,18 +788,23 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
                 return (False, False)
         elif not auto_approve and not dry_run:
             # Even without validation config, show basic info and ask for confirmation
+            print("\n" + "=" * 60)
+            print(f"LOADING SUMMARY: {table_name}")
+            print("=" * 60)
+            
             if not table_exists:
-                print("\n" + "=" * 60)
-                print(f"LOADING SUMMARY: {table_name}")
-                print("=" * 60)
                 print(f"Table Status: New table will be created")
-                print(f"Incoming Records: {len(features):,}")
             else:
-                print("\n" + "=" * 60)
-                print(f"LOADING SUMMARY: {table_name}")
-                print("=" * 60)
                 print(f"Table Status: Existing table will be replaced")
-                print(f"Incoming Records: {len(features):,}")
+                
+                # Show year boundary info
+                if year_boundary_info and year_boundary_info['crosses']:
+                    print(f"\nYEAR BOUNDARY CROSSED")
+                    print(f"  Previous year: {year_boundary_info['last_year']}")
+                    print(f"  Current year:  {year_boundary_info['current_year']}")
+                    print(f"  → Historical snapshot will be created in {table_name}_history")
+            
+            print(f"Incoming Records: {len(features):,}")
             
             if not prompt_user_approval(auto_approve, dry_run):
                 print("\nUpdate cancelled by user")
@@ -706,58 +815,50 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
             print("\n[DRY RUN COMPLETED - No changes were made]")
             return (True, False)
         
-        # STEP 2: YEARLY ARCHIVAL (after validation approval)
+        # STEP 3: PERFORM ARCHIVAL (we already checked, now execute)
         year_archived = False
-        if table_exists and not no_history:
-            # Check for year boundary crossing
-            crosses_year, last_year = check_year_boundary(db, table_name, schema)
+        if year_boundary_info and year_boundary_info['crosses']:
+            print(f"\n{'='*60}")
+            print(f"EXECUTING YEARLY ARCHIVAL")
+            print(f"{'='*60}")
             
-            # Force history if requested
-            if force_history and not crosses_year:
-                crosses_year = True
-                last_year = datetime.now().year  # Use current year for forced archive
-                print(f"\n[FORCE HISTORY: Archiving current data as year {last_year}]")
-            
-            if crosses_year and last_year is not None:
-                print(f"\n{'='*60}")
-                print(f"YEAR BOUNDARY DETECTED: {last_year} → {datetime.now().year}")
-                print(f"Proceeding with yearly snapshot archival...")
-                print(f"{'='*60}")
+            try:
+                # Start transaction for archive
+                db.execute_command("BEGIN")
                 
-                try:
-                    # Start transaction for archive
-                    db.execute_command("BEGIN")
-                    
-                    # Ensure history table exists
-                    history_table = ensure_history_table(db, table_name, schema)
-                    print(f"History table: {schema}.{history_table}")
-                    
-                    # Archive current table contents
-                    print(f"Archiving {last_year} data before replacement...")
-                    success = archive_to_history(db, table_name, history_table, schema, last_year)
-                    
-                    if success:
-                        print(f"✓ Successfully archived year {last_year} snapshot")
-                        db.execute_command("COMMIT")
-                        year_archived = True
-                    else:
-                        raise Exception("Archive operation failed")
-                    
-                except Exception as e:
-                    db.execute_command("ROLLBACK")
-                    print(f"✗ Archive failed: {e}")
-                    # Since we've already validated and approved, ask if they want to continue
-                    if not auto_approve:
-                        response = input("Continue without archiving? (yes/no): ").strip().lower()
-                        if response not in ['yes', 'y']:
-                            print("Operation cancelled due to archive failure")
-                            return (False, False)
-                    else:
-                        # In auto-approve mode, fail the operation if archival fails
-                        print("Operation cancelled due to archive failure (auto-approve mode)")
+                # Ensure history table exists
+                history_table = ensure_history_table(db, table_name, schema, target_srid or 4326)
+                print(f"History table: {schema}.{history_table}")
+                
+                # Archive current table contents
+                print(f"Archiving {year_boundary_info['last_year']} data before replacement...")
+                success = archive_to_history(
+                    db, table_name, history_table, schema, 
+                    year_boundary_info['last_year']
+                )
+                
+                if success:
+                    print(f"✓ Successfully archived year {year_boundary_info['last_year']} snapshot")
+                    db.execute_command("COMMIT")
+                    year_archived = True
+                else:
+                    raise Exception("Archive operation failed")
+                
+            except Exception as e:
+                db.execute_command("ROLLBACK")
+                print(f"✗ Archive failed: {e}")
+                # Since we've already validated and approved, ask if they want to continue
+                if not auto_approve:
+                    response = input("Continue without archiving? (yes/no): ").strip().lower()
+                    if response not in ['yes', 'y']:
+                        print("Operation cancelled due to archive failure")
                         return (False, False)
+                else:
+                    # In auto-approve mode, fail the operation if archival fails
+                    print("Operation cancelled due to archive failure (auto-approve mode)")
+                    return (False, False)
         
-        # STEP 3: REPLACE DATA
+        # STEP 4: REPLACE DATA
         if table_exists:
             print(f"Truncating existing table {schema}.{table_name}...")
             truncate_sql = f"TRUNCATE TABLE {schema}.{table_name}"
@@ -765,29 +866,33 @@ def load_geo_to_postgres_with_validation(file_path, table_name, db, target_srid=
             print("Table truncated successfully")
         else:
             # Create table and indexes if it doesn't exist
-            create_table_and_indexes(db, table_name, schema)
+            create_table_and_indexes(db, table_name, schema, target_srid or 4326, geometry_type)
         
-        # Prepare data for bulk insert
-        # Convert features to JSONB strings and add timestamps
+        # Prepare data for bulk insert - separate geometry from properties
         current_time = datetime.now()
         insert_data = []
         
         for feature in features:
-            # Serialize feature to JSON string
-            feature_json = json.dumps(feature, default=json_serializable)
-            # Add row with feature_data and load_dttm
-            insert_data.append([feature_json, current_time])
+            # Extract geometry as GeoJSON string for ST_GeomFromGeoJSON
+            geometry = feature.get('geometry')
+            geometry_json = json.dumps(geometry) if geometry else None
+            
+            # Extract only properties (not the full feature)
+            properties = feature.get('properties', {})
+            properties_json = json.dumps(properties, default=json_serializable)
+            
+            insert_data.append([geometry_json, properties_json, current_time])
         
-        # Use the generalized insert_data method
+        # Use the enhanced insert_data method with column_transforms
         print(f"Loading {len(features)} features into {schema}.{table_name}...")
         inserted_count = db.insert_data(
             table_name=table_name,
-            columns=['feature_data', 'load_dttm'],
+            columns=['geometry', 'properties', 'load_dttm'],
             data=insert_data,
             schema=schema,
             show_progress=True,
             batch_size=100,
-            commit_interval=1000
+            column_transforms={'geometry': 'ST_GeomFromGeoJSON'}
         )
         
         print(f"✓ Successfully loaded {inserted_count} features into {schema}.{table_name}")
@@ -909,7 +1014,7 @@ def process_file_list(file_list, db, source_dir, geo_dir, target_srid=None, sche
 
 def main():
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with validation and yearly snapshot support')
+    parser = argparse.ArgumentParser(description='Load geographic files to PostgreSQL with PostGIS geometry column')
     parser.add_argument('--dev', action='store_true', help='Use development environment', default=True)
     parser.add_argument('--prd', action='store_true', help='Use production environment', default=False)
     parser.add_argument('--file', type=str, help='Path to the geographic file (relative to SOURCE_DIR/geo_files or absolute)')
